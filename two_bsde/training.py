@@ -13,10 +13,19 @@ class TrainingHistory:
 
 def train(model, *, model_config, training_config, verbose=True):
     history = TrainingHistory()
+    other_parameters = [p for p in model.parameters() if p is not model.initial_value]
     optimizer = torch.optim.Adam(
-        model.parameters(), 
-        lr=training_config.learning_rate
-    )
+    [
+        {
+            "params": [model.initial_value],
+            "lr": training_config.initial_value_lr,
+        },
+        {
+            "params": other_parameters,
+            "lr": training_config.learning_rate,
+        },
+    ]
+)
 
     dtype = next(model.parameters()).dtype
     device = next(model.parameters()).device

@@ -51,8 +51,9 @@ class HamiltonianConfig: # hamiltonian optimiser setup
 @dataclass(frozen=True)
 class TrainingConfig: # training setup
     epochs: int = 500
-    batch_size: int = 96
-    learning_rate: float = 3e-3
+    batch_size: int = 128
+    initial_value_lr: float = 1e-4
+    learning_rate: float = 1e-3
     gradient_clip: float = 10.0
     value_loss_weight: float = 1.0
     gradient_loss_weight: float = 1.0
