@@ -9,7 +9,7 @@ class ModelConfig:
     hidden_dim: int = 1 # dimension of hidden state X
     observation_dim: int = 1 # dimension of observation Y
     control_dim: int = 1    # dimension of control u
-    num_hidden_states: int = 3 # number of hidden states
+    num_hidden_states: int = 3 # number of hidden states, i.e. number of states in the finite state problem
     num_time_steps: int = 12 
     network_width: int = 64
     network_depth: int = 3

@@ -4,20 +4,34 @@ import torch
 
 
 class BayesianControlProblem(ABC):
-    x_support: torch.Tensor
-    initial_observation: torch.Tensor
-    initial_posterior: torch.Tensor
-    control_low: torch.Tensor
-    control_high: torch.Tensor
-    auxiliary_control_path: torch.Tensor
+    x_support: torch.Tensor # [num_hidden_states, hidden_dim]
+    initial_observation: torch.Tensor # [observation_dim]
+    initial_posterior: torch.Tensor # [num_hidden_states]
+    control_low: torch.Tensor # [control_dim], lowest value in each dimension
+    control_high: torch.Tensor # [control_dim], largest value in each dimension 
+    auxiliary_control_path: torch.Tensor # [num_time_steps, control_dim]
 
-    def __init__(
-        self,
-        config,
-    ):
+    def __init__(self, config):
         self.config = config
 
-    def validate(self, config):
+    def validate(self, config): # check consistency of the problem with config.py
+        if self.x_support.shape[0] != (
+            config.num_hidden_states
+        ):
+            raise ValueError(
+                "x_support must contain "
+                f"{config.num_hidden_states} hidden states, "
+                f"got {self.x_support.shape[0]}"
+            )
+
+        if self.x_support.shape[1] != (
+                    config.hidden_dim
+                ):
+                    raise ValueError(
+                        "x_support must have dimension "
+                        f"{config.hidden_dim}, "
+                        f"got {self.x_support.shape[1]}"
+                    )
 
         if self.initial_observation.shape != (
             config.observation_dim,
@@ -65,26 +79,35 @@ class BayesianControlProblem(ABC):
                 f"{config.control_dim}), "
                 f"got {self.auxiliary_control_path.shape}"
             )
-
-        if self.x_support.shape[0] != (
-            config.num_hidden_states
-        ):
-            raise ValueError(
-                "x_support must contain "
-                f"{config.num_hidden_states} hidden states, "
-                f"got {self.x_support.shape[0]}"
-        )
+        
     
     @abstractmethod
     def sensor(self, control, observation):
+        '''
+            The sensor h evaluated at each hidden state, and regarded as a single tensor. 
+            output [batch, num_hidden_states, observation_dim]
+        '''
         pass
+
+    def validate_sensor(self, h_values):
+        expected = (self.config.num_hidden_states, self.config.observation_dim)
+        if h_values.shape[-2:] != expected:
+            raise ValueError(
+                f"sensor must end in {expected}, got {h_values.shape[-2:]}"
+            ) 
 
     @abstractmethod
     def running_cost(self, state, control):
+        """
+            output: [batch, num_time_steps]
+        """
         pass
 
     @abstractmethod
-    def terminal_cost(self, state):
+    def terminal_cost(self, state): 
+        """
+            output: [batch, ]
+        """
         pass
 
     def terminal_gradient(self, state):
