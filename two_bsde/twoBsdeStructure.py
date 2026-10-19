@@ -1,7 +1,8 @@
-"""Classical fixed-auxiliary geometric 2BSDE model."""
+"""Geometric 2BSDE models with fixed-auxiliary or pathwise Hamiltonian controls."""
 import torch
 from torch import nn
 import math
+import warnings
 from .dynamics import state_dynamics, stabilise_state
 from .networks import GeometricParallelBlock, TimeGeometricBlock, make_mlp
 
@@ -15,6 +16,9 @@ class GeometricClassicalFixedAux2BSDE(nn.Module):
         self.config = config
         self.geometry = geometry
         self.hamiltonian_optimizer = hamiltonian_optimizer
+
+        if getattr(problem, "auxiliary_control_path", None) is None:
+            raise ValueError("The fixed-auxiliary model requires problem.auxiliary_control_path")
 
         # one separate network block for A and Gamma at each time after t=0,
         # block k is evaluated at S_{k+1} and used for the next time step
@@ -84,6 +88,7 @@ class GeometricClassicalFixedAux2BSDE(nn.Module):
         aux_path = self.problem.auxiliary_control_path.to(dtype=dtype, device=device) # [num_time_steps, control_dim]
 
         for step in range(cfg.num_time_steps):
+            time = step * cfg.dt
             u_aux = aux_path[step][None, :].expand(batch, -1) # [batch, control_dim], fixed auxiliary control for this step
 
             drift_aux, sigma_aux, _ = state_dynamics(
@@ -94,7 +99,8 @@ class GeometricClassicalFixedAux2BSDE(nn.Module):
             h_min, u_star = self.hamiltonian_optimizer.minimise(
                 state, 
                 Z, 
-                Gamma
+                Gamma,
+                time=time,
             ) # h_min [batch], u_star [batch, control_dim], approximate Hamiltonian minimiser at the current auxiliary state
 
             # sigma_aux, shape [batch, state_dim, observation_dim]
@@ -175,26 +181,26 @@ class GeometricClassicalFixedAux2BSDE(nn.Module):
 
 class GeometricTimeBlockAdaptive2BSDE(nn.Module):
     """
-        State-dependent V0, shared A/Gamma time blocks and adaptive auxiliary controls.
+        State-dependent V0, shared time blocks and pathwise Hamiltonian controls.
 
         Every process and Hamiltonian is updated on the original fine time grid.
         Each block reuses its network parameters, evaluated at the current state.
-        At each fine step, average the most concentrated fraction of the batch's
-        Hamiltonian minimisers and apply this common control to the state paths.
+        At each fine step, each path uses its own Hamiltonian minimiser to update
+        its state and 2BSDE processes. No controls are pooled across paths.
 
-        num_blocks defaults to ceil(num_time_steps/10). The retained fraction
-        decreases linearly by block from first_control_fraction to last_control_fraction.
-        With one block, only first_control_fraction is used.
+        num_blocks defaults to ceil(num_time_steps/10). Blocks share network
+        parameters over time; the controls are recomputed at every fine step.
+        Legacy first_control_fraction/last_control_fraction arguments are ignored.
 
         initial_state_sampler(batch_size, *, dtype, device) may return [batch, state_dim].
         This lets the existing training loop learn V0 across different initial states.
         Without a sampler or explicit initial_states, all paths start at the problem's
         initial state. Training at that single state does not determine V0 elsewhere.
 
-        The batch controls form an interacting auxiliary simulation, not an individual
-        feedback policy. State-only A networks approximate the drift under this sampling
-        rule. Saving model.state_dict() includes V0 and the initial reference state;
-        save_blocks() saves only the A/Gamma networks, as in the original class.
+        Controls use the propagated Z and the current block's Gamma approximation.
+        The A network receives each path's own control. Saving model.state_dict()
+        includes all value/A/Gamma networks and the initial reference state;
+        save_blocks() saves all value/A/Gamma network weights.
     """
 
     def __init__(
@@ -204,7 +210,7 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
         geometry, 
         hamiltonian_optimizer,
         num_blocks=None, 
-        first_control_fraction=1.0, last_control_fraction=0.2,
+        first_control_fraction=None, last_control_fraction=None,
         initial_state_sampler=None, # optional, used when initial state is not a fixed value 
         track_gradient_consistency=False, # optional, to keep track of whether autograd of V is close to Z 
     ):
@@ -221,8 +227,11 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
         if not 1 <= num_blocks <= config.num_time_steps:
             raise ValueError("num_blocks must be between 1 and num_time_steps")
         
-        if not 0 < last_control_fraction <= first_control_fraction <= 1:
-            raise ValueError("Control fractions must satisfy 0 < last <= first <= 1")
+        if first_control_fraction is not None or last_control_fraction is not None:
+            warnings.warn(
+                "Control fractions are ignored: each path now uses its own Hamiltonian minimiser.",
+                DeprecationWarning, stacklevel=2,
+            )
         
         if initial_state_sampler is not None and not callable(initial_state_sampler):
             raise TypeError("initial_state_sampler must be callable")
@@ -243,11 +252,6 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
             (j * config.num_time_steps + num_blocks - 1) // num_blocks for j in range(num_blocks)
         ) # actual block boundaries on the fine grid, including non-divisible grids
 
-        self.control_fractions = tuple(
-            float(first_control_fraction + (last_control_fraction - first_control_fraction)
-                  * j / (num_blocks - 1)) if num_blocks > 1 else float(first_control_fraction)
-            for j in range(num_blocks)
-        )
         self.blocks = nn.ModuleList(TimeGeometricBlock(config, geometry) for _ in range(num_blocks))
 
         default_state = torch.cat((problem.initial_observation, problem.initial_posterior)).detach()
@@ -334,54 +338,6 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
         if self.geometry.basis.dtype != parameter.dtype or self.geometry.basis.device != parameter.device:
             raise ValueError("geometry.basis must have the same dtype and device as the model")
 
-    def concentrated_control(self, controls, fraction):
-        """
-            controls: [batch, control_dim], Hamiltonian minimisers at the current fine step
-            fraction: retained fraction in (0, 1]
-            output: mean control [control_dim], integer number of selected paths
-
-            For scalar controls, use the shortest sorted interval containing k controls.
-            For vector controls, use the smallest sample-centred k-neighbour radius,
-            after scaling each coordinate by its control-box width. This is a
-            sample-centred approximation to the most concentrated vector cluster.
-        """
-        if controls.ndim != 2 or controls.shape[1] != self.config.control_dim:
-            raise ValueError("controls must have shape [batch, control_dim]")
-        if controls.shape[0] == 0 or not 0 < fraction <= 1:
-            raise ValueError("A nonempty control batch and fraction in (0, 1] are required")
-        with torch.no_grad(): # no derivative through sorting, cluster selection or the auxiliary control
-            controls = controls.detach()
-            batch = controls.shape[0]
-            count = min(batch, max(1, math.ceil(fraction * batch - 1e-12)))
-            if count == batch:
-                selected = controls # 100 percent means the mean of the whole batch
-            elif self.config.control_dim == 1:
-                ordered = controls[:, 0].sort(stable=True).values
-                widths = ordered[count-1:] - ordered[:batch-count+1]
-                start = int(widths.argmin().item()) # ties choose the leftmost interval
-                selected = ordered[start:start+count, None] # [count, 1]
-            else:
-                lo = self.problem.control_low.to(controls)
-                hi = self.problem.control_high.to(controls)
-                scale = hi - lo
-                scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-                scaled = (controls - lo) / scale
-                # Inspect centres in chunks to avoid storing a full batch-by-batch distance matrix.
-                best_radius, best_indices = None, None
-                for start in range(0, batch, 256):
-                    distance = torch.cdist(scaled[start:start+256], scaled)
-                    neighbours = distance.argsort(dim=-1, stable=True)[:, :count]
-                    radii = distance.gather(1, neighbours[:, -1:]).squeeze(-1)
-                    centre = int(radii.argmin().item())
-                    radius = float(radii[centre].item())
-                    if best_radius is None or radius < best_radius:
-                        best_radius, best_indices = radius, neighbours[centre]
-                selected = controls[best_indices] # [count, control_dim]
-            representative = selected.mean(dim=0) # [control_dim], one common auxiliary control
-            representative = self.hamiltonian_optimizer.project_control(representative)
-        return representative.detach(), count
-
-
     def forward(
         self, innovations, return_paths=False, *, initial_states=None,
         start_step=0, return_training=False,
@@ -407,15 +363,16 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
         gap_sum, martingale_sum = torch.zeros_like(running_sum), torch.zeros_like(running_sum)
         if return_paths:
             S_path, R_path, Z_path, value_path = [state], [R], [Z], [R]
-            A_path, G_path, u_aux_path, u_star_path, counts = [], [], [], [], []
+            A_path, G_path, u_aux_path, u_star_path = [], [], [], []
 
         for local_step, step in enumerate(range(start_step, cfg.num_time_steps)):
             time, block_index = step * cfg.dt, self.block_for_step[step]
             block = self.blocks[block_index]
             Gamma = block.gamma(time, state) # evaluate the current block at every fine step
-            h_min, u_star = self.hamiltonian_optimizer.minimise(state, Z, Gamma)
-            representative, count = self.concentrated_control(u_star, self.control_fractions[block_index])
-            u_aux = representative[None, :].expand(batch, -1)
+            h_min, u_star = self.hamiltonian_optimizer.minimise(state, Z, Gamma, time=time)
+            if u_star.shape != (batch, cfg.control_dim):
+                raise ValueError("Hamiltonian minimisers must have shape [batch, control_dim]")
+            u_aux = u_star.detach() # each path uses its own fine-step minimiser; no batch averaging
             A = block.drift_gradient(time, state, u_aux) # the Itô drift of Z also depends on the actual auxiliary control
             drift, sigma, _ = state_dynamics(
                 state, u_aux, problem=self.problem, config=cfg, geometry=self.geometry
@@ -426,7 +383,7 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
             martingale_increment = (torch.einsum("bi,bia->ba", Z, sigma) * dI).sum(-1)
             if metrics:
                 with torch.no_grad(): # cost and gap diagnostics never enter the optimisation graph
-                    running = self.problem.running_cost(state, u_aux)
+                    running = self.problem.running_cost(state, u_aux, time=time)
                     if running.shape != (batch,):
                         raise ValueError("running_cost must return [batch] for a single time step")
                     running_sum = running_sum + running * cfg.dt
@@ -461,7 +418,6 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
                 G_path.append(Gamma)
                 u_aux_path.append(u_aux)
                 u_star_path.append(u_star)
-                counts.append(count)
 
         correction_rate = torch.stack(correction_rates).mean() if correction_rates else zero.detach()
         if not metrics:
@@ -493,17 +449,13 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
                 "value_path": torch.stack(value_path, 1), # independently evaluated value heads, alongside propagated R
                 "A_path": stack_or_empty(A_path, (cfg.state_dim,)),
                 "Gamma_path": stack_or_empty(G_path, (cfg.state_dim, cfg.state_dim)),
-                "u_aux_path": stack_or_empty(u_aux_path, (cfg.control_dim,)),
+                "u_aux_path": stack_or_empty(u_aux_path, (cfg.control_dim,)), # same pathwise controls as u_star_path
                 "u_star_path": stack_or_empty(u_star_path, (cfg.control_dim,)),
                 "time_path": torch.tensor(
                     [k * cfg.dt for k in range(start_step, cfg.num_time_steps)] + [cfg.horizon],
                     dtype=state.dtype, device=state.device,
                 ),
                 "block_index_path": torch.tensor(self.block_for_step[start_step:], dtype=torch.long, device=state.device),
-                "control_fraction_path": torch.tensor(
-                    [self.control_fractions[b] for b in self.block_for_step[start_step:]], dtype=state.dtype, device=state.device,
-                ),
-                "retained_control_count_path": torch.tensor(counts, dtype=torch.long, device=state.device),
             })
         return result
 
@@ -530,8 +482,9 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
     def rollout_policy(self, innovations, *, initial_states=None, start_step=0):
         """
             Fresh individual feedback rollout: minimise H using derivatives of v_j(t,S).
-            Controls are recomputed on these policy states; no clustered averaging and no
-            propagated auxiliary Z are used. Costs are diagnostic only, with no outer graph.
+            Controls are recomputed using value-network derivatives at these policy states.
+            The training rollout instead uses propagated Z and the separate Gamma network.
+            Costs are diagnostic only, with no outer graph.
         """
         self._check_innovations(innovations, start_step)
         cfg = self.config
@@ -543,9 +496,10 @@ class GeometricTimeBlockAdaptive2BSDE(nn.Module):
             states, controls, corrections = [state], [], []
             cost = torch.zeros_like(initial_values)
             for local_step, step in enumerate(range(start_step, cfg.num_time_steps)):
-                _, Z, Gamma = self.value_gradient_hessian(step * cfg.dt, state)
-                _, control = self.hamiltonian_optimizer.minimise(state, Z, Gamma)
-                cost = cost + self.problem.running_cost(state, control) * cfg.dt
+                time = step * cfg.dt
+                _, Z, Gamma = self.value_gradient_hessian(time, state)
+                _, control = self.hamiltonian_optimizer.minimise(state, Z, Gamma, time=time)
+                cost = cost + self.problem.running_cost(state, control, time=time) * cfg.dt
                 drift, sigma, _ = state_dynamics(
                     state, control, problem=self.problem, config=cfg, geometry=self.geometry
                 )

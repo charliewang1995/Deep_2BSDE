@@ -13,8 +13,9 @@ class HamiltonianOptimizer:
         self.optimizer_config = optimizer_config
         self.geometry = geometry
 
-    def evaluate(self, state, gradient, gamma, control):
+    def evaluate(self, state, gradient, gamma, control, *, time):
         """
+            time: scalar current time, shared across the batch and control candidates.
             state, gradient: [batch, state_dim]
             gamma: [batch, state_dim, state_dim], control: [batch, control_dim]
             output: [batch], the Hamiltonian at the given control
@@ -26,7 +27,7 @@ class HamiltonianOptimizer:
             config=self.model_config,
             geometry=self.geometry,
         ) # drift [batch, state_dim], sigma [batch, state_dim, observation_dim]
-        running = self.problem.running_cost(state, control) # [batch]
+        running = self.problem.running_cost(state, control, time=time) # [batch] or [batch, K]
         linear = (drift * gradient).sum(dim=-1) # [batch], drift dotted with the value gradient
 
         # sigma, shape [batch, state_dim, observation_dim]
@@ -55,8 +56,9 @@ class HamiltonianOptimizer:
         starts[0] = 0.5 * (lo + hi) # replace the first start by the midpoint
         return self.project_control(starts)
 
-    def minimise(self, state, gradient, gamma):
+    def minimise(self, state, gradient, gamma, *, time):
         """
+            time: scalar current time; every candidate is evaluated at this time.
             state, gradient: [batch, state_dim], gamma: [batch, state_dim, state_dim]
             output: h_min [batch], u_star [batch, control_dim]
             The minimum is approximate, using a grid or a fixed number of Adam steps.
@@ -79,11 +81,11 @@ class HamiltonianOptimizer:
             z = gradient.detach()[:, None, :].expand(-1, K, -1) # [batch, K, state_dim]
             g = gamma.detach()[:, None, :, :].expand(-1, K, -1, -1) # [batch, K, state_dim, state_dim]
             with torch.no_grad():
-                values = self.evaluate(s, z, g, controls) # [batch, K]
+                values = self.evaluate(s, z, g, controls, time=time) # [batch, K]
                 idx = values.argmin(dim=1) # [batch], best grid point for each state
                 bidx = torch.arange(batch, device=state.device)
                 u_star = controls[bidx, idx].detach() # [batch, 1]
-            h_min = self.evaluate(state, gradient, gamma, u_star) # original inputs retain gradients, u_star is treated as fixed
+            h_min = self.evaluate(state, gradient, gamma, u_star, time=time) # original inputs retain gradients, u_star is treated as fixed
             return h_min, u_star
 
         # Multidimensional control: run projected Adam from K starts for each state.
@@ -100,7 +102,7 @@ class HamiltonianOptimizer:
         with torch.enable_grad(): # the inner control search also needs gradients during evaluation
             for _ in range(self.optimizer_config.num_steps):
                 u = self.project_control(variable) # [batch, K, control_dim]
-                values = self.evaluate(s, z, g, u) # [batch, K]
+                values = self.evaluate(s, z, g, u, time=time) # [batch, K]
                 loss = values.mean() # scalar objective over all states and starts
                 inner.zero_grad(set_to_none=True)
                 loss.backward()
@@ -112,9 +114,9 @@ class HamiltonianOptimizer:
                     variable.copy_(self.project_control(variable)) # project back into the box after each update
         with torch.no_grad():
             candidates = self.project_control(variable) # [batch, K, control_dim], final candidates
-            values = self.evaluate(s, z, g, candidates) # [batch, K]
+            values = self.evaluate(s, z, g, candidates, time=time) # [batch, K]
             idx = values.argmin(dim=1) # [batch], best final candidate for each state
             bidx = torch.arange(batch, device=state.device)
             u_star = candidates[bidx, idx].detach() # [batch, control_dim], no derivative through the chosen control
-        h_min = self.evaluate(state, gradient, gamma, u_star) # re-evaluate with original inputs, treating u_star as fixed
+        h_min = self.evaluate(state, gradient, gamma, u_star, time=time) # re-evaluate with original inputs, treating u_star as fixed
         return h_min, u_star

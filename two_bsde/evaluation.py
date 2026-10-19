@@ -45,8 +45,10 @@ def evaluate_time_blocks(
         start_step: global fine-grid starting index; simulate the remaining horizon
         output: EvaluationResult with auxiliary paths and, optionally, independent policy paths
 
-        Auxiliary costs and Hamiltonian gaps are consistency diagnostics, not policy-cost targets.
-        Policy costs use fresh noise and the same frozen starting states, with individual feedback.
+        The main rollout uses each path's own minimiser based on propagated Z and
+        the Gamma network. Its Hamiltonian gap is zero up to numerical roundoff.
+        The separate policy diagnostic uses fresh noise and value-network derivatives
+        at the same frozen starting states. Neither cost is a training target.
     """
     cfg = model.config
     if isinstance(num_paths, bool) or not isinstance(num_paths, int) or num_paths < 1:
@@ -94,7 +96,7 @@ def evaluate_time_blocks(
             }
             diagnostics = {
                 name: float(value.detach().cpu()) for name, value in metrics.items()
-            } # no independent-sample standard error is assigned to the coupled auxiliary batch
+            } # summaries over the pathwise rollout, retaining the existing diagnostic names
             paths["corrected_auxiliary_cost"] = corrected_cost
             paths["auxiliary_identity_residual"] = identity_residual
 
