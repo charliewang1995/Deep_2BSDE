@@ -1,6 +1,7 @@
 # global parameter setting
 
 from dataclasses import dataclass
+import math
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,11 @@ class ModelConfig:
     value_initial_guess: float = 0.01 # initial guess for the value function, also the initial value for V0 
     gamma_initial_scale: float = 0.02 # 
     posterior_eps: float = 1e-8 # correcting bound for posterior dynamic
+    observation_noise_std: float = 1.0 # positive scalar sigma in dY = h dt + sigma dW
+
+    def __post_init__(self):
+        if not math.isfinite(self.observation_noise_std) or self.observation_noise_std <= 0:
+            raise ValueError("observation_noise_std must be finite and strictly positive")
 
     @property
     def dt(self):
